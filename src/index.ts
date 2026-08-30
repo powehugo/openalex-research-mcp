@@ -28,6 +28,7 @@ import {
   externalSourceStatus, federalRegisterDocument, federalRegisterSearch, regulationsSearch,
   semanticScholarEdges, semanticScholarPaper, semanticScholarRecommendations, semanticScholarSearch,
 } from './external-clients.js';
+import { hasValidOAuthToken, oauthConfigured, oauthProtectedResourceMetadata } from './oauth-auth.js';
 
 // Handle `openalex-research-mcp setup [flags]` before starting the MCP server
 if (process.argv[2] === 'setup') {
@@ -2146,6 +2147,17 @@ function hasValidBearerToken(req: IncomingMessage): boolean {
   return expectedBytes.length === suppliedBytes.length && timingSafeEqual(expectedBytes, suppliedBytes);
 }
 
+function authMode(): 'bearer' | 'oauth' | 'mixed' {
+  const configured = (process.env.MCP_AUTH_MODE || 'bearer').trim().toLowerCase();
+  return configured === 'oauth' || configured === 'mixed' ? configured : 'bearer';
+}
+
+async function isAuthorized(req: IncomingMessage): Promise<boolean> {
+  const mode = authMode();
+  if ((mode === 'bearer' || mode === 'mixed') && hasValidBearerToken(req)) return true;
+  return (mode === 'oauth' || mode === 'mixed') && await hasValidOAuthToken(req);
+}
+
 async function startHttp(): Promise<void> {
   const endpoint = process.env.MCP_HTTP_ENDPOINT_PATH || '/mcp';
   const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
@@ -2158,7 +2170,23 @@ async function startHttp(): Promise<void> {
     if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
     if (url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, authentication: { type: 'bearer', configured: !!process.env.MCP_BEARER_TOKEN }, sources: externalSourceStatus() }));
+      const mode = authMode();
+      const configured = mode === 'bearer'
+        ? !!process.env.MCP_BEARER_TOKEN?.trim()
+        : mode === 'oauth'
+          ? oauthConfigured()
+          : !!process.env.MCP_BEARER_TOKEN?.trim() && oauthConfigured();
+      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, authentication: { type: mode, configured }, sources: externalSourceStatus() }));
+      return;
+    }
+    if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
+      if (!oauthConfigured()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'OAuth is not configured' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(oauthProtectedResourceMetadata()));
       return;
     }
     if (url.pathname !== endpoint) {
@@ -2166,13 +2194,23 @@ async function startHttp(): Promise<void> {
       res.end(JSON.stringify({ error: 'Not found', mcpEndpoint: endpoint, healthEndpoint: '/health' }));
       return;
     }
-    if (!process.env.MCP_BEARER_TOKEN?.trim()) {
+    const mode = authMode();
+    const authIsConfigured = mode === 'bearer'
+      ? !!process.env.MCP_BEARER_TOKEN?.trim()
+      : mode === 'oauth'
+        ? oauthConfigured()
+        : !!process.env.MCP_BEARER_TOKEN?.trim() && oauthConfigured();
+    if (!authIsConfigured) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'MCP_BEARER_TOKEN is not configured' }));
+      res.end(JSON.stringify({ error: `${mode} authentication is not configured` }));
       return;
     }
-    if (!hasValidBearerToken(req)) {
-      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer realm="scholarly-mcp"' });
+    if (!await isAuthorized(req)) {
+      const publicUrl = (process.env.MCP_PUBLIC_URL || `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host || 'localhost'}`).replace(/\/$/, '');
+      const challenge = oauthConfigured()
+        ? `Bearer realm="scholarly-mcp", resource_metadata="${publicUrl}/.well-known/oauth-protected-resource"`
+        : 'Bearer realm="scholarly-mcp"';
+      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': challenge });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
