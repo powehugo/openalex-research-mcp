@@ -2,8 +2,12 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createServer as createHttpServer, IncomingMessage, ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import {
   CallToolRequestSchema,
+  isInitializeRequest,
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
@@ -19,6 +23,11 @@ import {
 } from './formatters.js';
 import { buildFilter } from './filter.js';
 import { wrapPhraseSearch, applySearchField } from './search-helpers.js';
+import {
+  EXTERNAL_TOOLS, arxivSearch, crossrefDoi, crossrefSearch, dataCiteDoi, dataCiteSearch,
+  externalSourceStatus, federalRegisterDocument, federalRegisterSearch, regulationsSearch,
+  semanticScholarEdges, semanticScholarPaper, semanticScholarRecommendations, semanticScholarSearch,
+} from './external-clients.js';
 
 // Handle `openalex-research-mcp setup [flags]` before starting the MCP server
 if (process.argv[2] === 'setup') {
@@ -1030,6 +1039,8 @@ const tools: Tool[] = [
     },
   },
 
+  ...EXTERNAL_TOOLS,
+
   {
     name: 'health_check',
     description:
@@ -1041,7 +1052,8 @@ const tools: Tool[] = [
   },
 ];
 
-// Create server instance
+// Create an independently stateful MCP server for stdio or each HTTP session.
+function createMcpServer(): Server {
 const server = new Server(
   {
     name: 'openalex-mcp',
@@ -2016,6 +2028,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'semantic_scholar_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await semanticScholarSearch(params), null, 2) }] };
+      case 'semantic_scholar_get_paper':
+        return { content: [{ type: 'text', text: JSON.stringify(await semanticScholarPaper(params), null, 2) }] };
+      case 'semantic_scholar_get_citations':
+        return { content: [{ type: 'text', text: JSON.stringify(await semanticScholarEdges(params, 'citations'), null, 2) }] };
+      case 'semantic_scholar_get_references':
+        return { content: [{ type: 'text', text: JSON.stringify(await semanticScholarEdges(params, 'references'), null, 2) }] };
+      case 'semantic_scholar_recommend':
+        return { content: [{ type: 'text', text: JSON.stringify(await semanticScholarRecommendations(params), null, 2) }] };
+      case 'datacite_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await dataCiteSearch(params), null, 2) }] };
+      case 'datacite_get_doi':
+        return { content: [{ type: 'text', text: JSON.stringify(await dataCiteDoi(params), null, 2) }] };
+      case 'arxiv_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await arxivSearch(params), null, 2) }] };
+      case 'crossref_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await crossrefSearch(params), null, 2) }] };
+      case 'crossref_get_doi':
+        return { content: [{ type: 'text', text: JSON.stringify(await crossrefDoi(params), null, 2) }] };
+      case 'federal_register_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await federalRegisterSearch(params), null, 2) }] };
+      case 'federal_register_get_document':
+        return { content: [{ type: 'text', text: JSON.stringify(await federalRegisterDocument(params), null, 2) }] };
+      case 'regulations_gov_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await regulationsSearch(params), null, 2) }] };
+
       case 'health_check': {
         return {
           content: [
@@ -2042,6 +2081,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   maxPageSize: CONFIG.MCP.MAX_PAGE_SIZE,
                   rateLimit: CONFIG.API.RATE_LIMIT,
                 },
+                externalSources: externalSourceStatus(),
               }, null, 2),
             },
           ],
@@ -2075,11 +2115,88 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+return server;
+}
+
+const server = createMcpServer();
+
 // Start server
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  if (!chunks.length) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function setCors(res: ServerResponse): void {
+  const configured = process.env.MCP_ALLOWED_ORIGINS?.trim();
+  res.setHeader('Access-Control-Allow-Origin', configured || '*');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, mcp-protocol-version, mcp-session-id, authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+}
+
+async function startHttp(): Promise<void> {
+  const endpoint = process.env.MCP_HTTP_ENDPOINT_PATH || '/mcp';
+  const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
+  const port = Number(process.env.PORT || process.env.MCP_HTTP_PORT || 3000);
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+
+  const httpServer = createHttpServer(async (req, res) => {
+    setCors(res);
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, sources: externalSourceStatus() }));
+      return;
+    }
+    if (url.pathname !== endpoint) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found', mcpEndpoint: endpoint, healthEndpoint: '/health' }));
+      return;
+    }
+    try {
+      const body = req.method === 'POST' ? await readJsonBody(req) : undefined;
+      const sessionHeader = req.headers['mcp-session-id'];
+      const sessionId = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+      let transport = sessionId ? transports.get(sessionId) : undefined;
+
+      if (!transport && req.method === 'POST' && isInitializeRequest(body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
+          onsessioninitialized: (id) => { transports.set(id, transport!); },
+        });
+        transport.onclose = () => {
+          if (transport?.sessionId) transports.delete(transport.sessionId);
+        };
+        await createMcpServer().connect(transport);
+      }
+
+      if (!transport) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Missing or invalid MCP session' }, id: null }));
+        return;
+      }
+      await transport.handleRequest(req, res, body);
+    } catch (error) {
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  });
+  httpServer.listen(port, host, () => console.error(`[gateway] HTTP MCP listening on ${host}:${port}${endpoint}`));
+}
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  debug('Server running on stdio');
+  const httpMode = process.argv.includes('--http') || /^(http|streamable-http)$/i.test(process.env.MCP_TRANSPORT_TYPE || '');
+  if (httpMode) {
+    await startHttp();
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    debug('Server running on stdio');
+  }
 }
 
 main().catch((error) => {

@@ -1,6 +1,6 @@
 {
   "name": "openalex-research-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "MCP server for OpenAlex API - enabling literature review and research landscaping",
   "type": "module",
   "main": "build/index.js",
@@ -17,6 +17,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
+    "start:http": "node build/index.js --http",
     "dev": "tsc && node build/index.js",
     "watch": "tsc --watch",
     "test": "vitest run",

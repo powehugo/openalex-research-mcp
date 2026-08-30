@@ -1,5 +1,20 @@
 # OpenAlex MCP Server
 
+## Multi-source scholarly gateway
+
+Version 0.6 can run as a Streamable HTTP MCP gateway (`npm run start:http`) and adds these read-only sources to the existing OpenAlex tools:
+
+- Semantic Scholar Academic Graph, citation/reference traversal, and Recommendations
+- DataCite public DOI and research-object metadata
+- arXiv search and normalized Atom metadata
+- Crossref DOI lookup and metadata validation
+- Federal Register document search and lookup
+- Regulations.gov search when `DATA_GOV_API_KEY` is configured
+
+Configure `S2_API_KEY` as a deployment secret. DataCite, arXiv, Crossref, and Federal Register do not require API keys for these public operations. `CROSSREF_MAILTO` is optional but recommended for polite API usage. EUR-Lex is intentionally deferred because its web service requires a separate account and credentials.
+
+HTTP deployments expose the MCP endpoint at `/mcp` (override with `MCP_HTTP_ENDPOINT_PATH`) and an unauthenticated status endpoint at `/health`. Health responses report only whether secrets are configured, never their values.
+
 A Model Context Protocol (MCP) server that provides access to OpenAlex, a comprehensive open catalog of scholarly papers, authors, institutions, and more. Designed to empower AI assistants to conduct literature reviews, analyze research trends, and map the scholarly landscape.
 
 ## Quick Install
