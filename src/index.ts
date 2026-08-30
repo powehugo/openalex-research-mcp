@@ -4,7 +4,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   CallToolRequestSchema,
   isInitializeRequest,
@@ -2136,6 +2136,16 @@ function setCors(res: ServerResponse): void {
   res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
 }
 
+function hasValidBearerToken(req: IncomingMessage): boolean {
+  const expected = process.env.MCP_BEARER_TOKEN?.trim();
+  if (!expected) return false;
+  const header = req.headers.authorization || '';
+  const supplied = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const expectedBytes = Buffer.from(expected);
+  const suppliedBytes = Buffer.from(supplied);
+  return expectedBytes.length === suppliedBytes.length && timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
 async function startHttp(): Promise<void> {
   const endpoint = process.env.MCP_HTTP_ENDPOINT_PATH || '/mcp';
   const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
@@ -2148,12 +2158,22 @@ async function startHttp(): Promise<void> {
     if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
     if (url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, sources: externalSourceStatus() }));
+      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, authentication: { type: 'bearer', configured: !!process.env.MCP_BEARER_TOKEN }, sources: externalSourceStatus() }));
       return;
     }
     if (url.pathname !== endpoint) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found', mcpEndpoint: endpoint, healthEndpoint: '/health' }));
+      return;
+    }
+    if (!process.env.MCP_BEARER_TOKEN?.trim()) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'MCP_BEARER_TOKEN is not configured' }));
+      return;
+    }
+    if (!hasValidBearerToken(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer realm="scholarly-mcp"' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
     try {
