@@ -111,6 +111,17 @@ export class OpenAlexClient {
     this.client.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
+        if ([401, 403].includes(Number(error.response?.status)) && error.config) {
+          const config = error.config as any;
+          if (this.apiKey && config.params?.api_key && !config._openAlexPublicRetry) {
+            config._openAlexPublicRetry = true;
+            delete config.params.api_key;
+            if (this.email) config.params.mailto = this.email;
+            this.apiKey = undefined;
+            debug('OpenAlex rejected the configured API key; retrying through the public read-only API.');
+            return this.client.request(config);
+          }
+        }
         if (error.response?.status === 429 && error.config) {
           const config = error.config as any;
           config._429RetryCount = (config._429RetryCount || 0) + 1;

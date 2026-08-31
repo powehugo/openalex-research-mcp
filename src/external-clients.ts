@@ -3,8 +3,12 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 const TIMEOUT_MS = 30_000;
 const ARXIV_TIMEOUT_MS = 8_000;
+const S2_MIN_INTERVAL_MS = 1_100;
 const USER_AGENT = process.env.SCHOLARLY_API_USER_AGENT ||
   'openalex-research-mcp/0.6 (scholarly metadata gateway)';
+
+let s2ThrottleQueue: Promise<void> = Promise.resolve();
+let s2LastRequestStartedAt = 0;
 
 const pagination = {
   limit: { type: 'number', description: 'Maximum number of results to return' },
@@ -57,8 +61,32 @@ function s2(): AxiosInstance {
   return client('https://api.semanticscholar.org', apiKey ? { 'x-api-key': apiKey } : {});
 }
 
+async function waitForS2Slot(): Promise<void> {
+  const slot = s2ThrottleQueue.then(async () => {
+    const waitMs = Math.max(0, S2_MIN_INTERVAL_MS - (Date.now() - s2LastRequestStartedAt));
+    if (waitMs) await new Promise(resolve => setTimeout(resolve, waitMs));
+    s2LastRequestStartedAt = Date.now();
+  });
+  s2ThrottleQueue = slot.catch(() => undefined);
+  await slot;
+}
+
+async function s2Request<T>(request: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    await waitForS2Slot();
+    try {
+      return await request();
+    } catch (error: any) {
+      if (Number(error?.response?.status) !== 429 || attempt >= 2) throw error;
+      const retryAfter = Math.max(1, Number(error?.response?.headers?.['retry-after']) || 1);
+      await new Promise(resolve => setTimeout(resolve, Math.min(retryAfter * 1000, 10_000)));
+    }
+  }
+}
+
 export async function semanticScholarSearch(params: any): Promise<unknown> {
-  const response = await s2().get('/graph/v1/paper/search', { params: {
+  const api = s2();
+  const response = await s2Request(() => api.get('/graph/v1/paper/search', { params: {
     query: required(params.query, 'query'),
     limit: bounded(params.limit, 10, 100),
     offset: Math.max(0, Number(params.offset) || 0),
@@ -66,22 +94,24 @@ export async function semanticScholarSearch(params: any): Promise<unknown> {
     ...(params.year ? { year: String(params.year) } : {}),
     ...(params.fields_of_study ? { fieldsOfStudy: String(params.fields_of_study) } : {}),
     ...(params.open_access_pdf !== undefined ? { openAccessPdf: String(!!params.open_access_pdf) } : {}),
-  }});
+  }}));
   return response.data;
 }
 
 export async function semanticScholarPaper(params: any): Promise<unknown> {
   const id = encodeURIComponent(required(params.paper_id, 'paper_id'));
-  return (await s2().get(`/graph/v1/paper/${id}`, { params: { fields: S2_FIELDS } })).data;
+  const api = s2();
+  return (await s2Request(() => api.get(`/graph/v1/paper/${id}`, { params: { fields: S2_FIELDS } }))).data;
 }
 
 export async function semanticScholarEdges(params: any, edge: 'citations' | 'references'): Promise<unknown> {
   const id = encodeURIComponent(required(params.paper_id, 'paper_id'));
-  return (await s2().get(`/graph/v1/paper/${id}/${edge}`, { params: {
+  const api = s2();
+  return (await s2Request(() => api.get(`/graph/v1/paper/${id}/${edge}`, { params: {
     limit: bounded(params.limit, 20, 1000),
     offset: Math.max(0, Number(params.offset) || 0),
     fields: S2_FIELDS,
-  }})).data;
+  }}))).data;
 }
 
 export async function semanticScholarRecommendations(params: any): Promise<unknown> {
@@ -92,10 +122,11 @@ export async function semanticScholarRecommendations(params: any): Promise<unkno
     ? params.negative_paper_ids.filter((id: unknown) => typeof id === 'string' && id.trim()).slice(0, 100)
     : [];
   if (!positivePaperIds.length) throw new Error('positive_paper_ids must contain at least one paper ID');
-  return (await s2().post('/recommendations/v1/papers',
+  const api = s2();
+  return (await s2Request(() => api.post('/recommendations/v1/papers',
     { positivePaperIds, negativePaperIds },
     { params: { limit: bounded(params.limit, 20, 500), fields: S2_FIELDS } },
-  )).data;
+  ))).data;
 }
 
 export async function dataCiteSearch(params: any): Promise<unknown> {
