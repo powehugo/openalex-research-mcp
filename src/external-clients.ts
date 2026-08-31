@@ -209,15 +209,25 @@ async function arxivOpenAlexFallback(
       ? `${sortOrder}updated_date`
       : undefined;
   const apiKey = process.env.OPENALEX_API_KEY?.trim();
-  const response = await client('https://api.openalex.org').get('/works', { params: {
+  const queryParams = {
     search: normalizedQuery,
     filter: 'locations.source.id:S4306400194',
     'per-page': maxResults,
     page: Math.floor(start / maxResults) + 1,
     select: 'id,display_name,doi,publication_date,updated_date,authorships,locations,primary_topic',
     ...(sort ? { sort } : {}),
-    ...(apiKey ? { api_key: apiKey } : {}),
-  }});
+  };
+  let response;
+  try {
+    response = await client('https://api.openalex.org').get('/works', { params: {
+      ...queryParams,
+      ...(apiKey ? { api_key: apiKey } : {}),
+    }});
+  } catch (error: any) {
+    const status = Number(error?.response?.status) || 0;
+    if (!apiKey || ![401, 403].includes(status)) throw error;
+    response = await client('https://api.openalex.org').get('/works', { params: queryParams });
+  }
   const data = response.data || {};
   const results = Array.isArray(data.results) ? data.results : [];
   const entries = results.map((work: any) => {
