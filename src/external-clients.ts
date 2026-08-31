@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 const TIMEOUT_MS = 30_000;
+const ARXIV_TIMEOUT_MS = 8_000;
 const USER_AGENT = process.env.SCHOLARLY_API_USER_AGENT ||
   'openalex-research-mcp/0.6 (scholarly metadata gateway)';
 
@@ -18,7 +19,7 @@ export const EXTERNAL_TOOLS: Tool[] = [
   { name: 'semantic_scholar_recommend', description: 'Find semantic-neighbor papers from positive and optional negative seed papers using the Recommendations API.', inputSchema: { type: 'object', properties: { positive_paper_ids: { type: 'array', items: { type: 'string' }, description: 'One or more relevant Semantic Scholar paper IDs' }, negative_paper_ids: { type: 'array', items: { type: 'string' }, description: 'Optional irrelevant seed paper IDs' }, limit: { type: 'number', maximum: 500 } }, required: ['positive_paper_ids'] } },
   { name: 'datacite_search', description: 'Search public DataCite DOI metadata for datasets, software, reports, and other research objects. No API key required.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, resource_type_id: { type: 'string', description: 'DataCite resource type, e.g. dataset or software' }, published: { type: 'string', description: 'Published year or range supported by DataCite' }, sort: { type: 'string', description: 'Sort such as relevance, -published, or -citation-count' }, page: { type: 'number' }, page_size: { type: 'number', maximum: 1000 } }, required: ['query'] } },
   { name: 'datacite_get_doi', description: 'Retrieve a complete public DataCite DOI metadata record and related identifiers.', inputSchema: { type: 'object', properties: { doi: { type: 'string' } }, required: ['doi'] } },
-  { name: 'arxiv_search', description: 'Search arXiv preprints and return normalized Atom metadata. Use to audit very recent work before claiming novelty.', inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'arXiv query syntax, e.g. all:"mental health" AND all:chatbot' }, start: { type: 'number' }, max_results: { type: 'number', maximum: 100 }, sort_by: { type: 'string', enum: ['relevance', 'lastUpdatedDate', 'submittedDate'] }, sort_order: { type: 'string', enum: ['ascending', 'descending'] } }, required: ['query'] } },
+  { name: 'arxiv_search', description: 'Search arXiv preprints and return normalized metadata. Uses the official Atom API first and transparently falls back to OpenAlex records hosted by arXiv when the official API is rate-limited or unavailable.', inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'arXiv query syntax, e.g. all:"mental health" AND all:chatbot' }, start: { type: 'number' }, max_results: { type: 'number', maximum: 100 }, sort_by: { type: 'string', enum: ['relevance', 'lastUpdatedDate', 'submittedDate'] }, sort_order: { type: 'string', enum: ['ascending', 'descending'] } }, required: ['query'] } },
   { name: 'crossref_search', description: 'Search Crossref metadata for DOI discovery and bibliographic validation. No API key required.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, rows: { type: 'number', maximum: 1000 }, offset: { type: 'number' }, filter: { type: 'string', description: 'Crossref filter expression' }, select: { type: 'string', description: 'Comma-separated Crossref fields to return' } }, required: ['query'] } },
   { name: 'crossref_get_doi', description: 'Resolve and validate a DOI against Crossref metadata, including updates, funding, licenses, and trusted-source assertions when present.', inputSchema: { type: 'object', properties: { doi: { type: 'string' } }, required: ['doi'] } },
   { name: 'federal_register_search', description: 'Search official U.S. Federal Register documents, including rules, proposed rules, notices, and presidential documents.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, agency: { type: 'string', description: 'Agency slug used by Federal Register' }, document_type: { type: 'string', enum: ['RULE', 'PRORULE', 'NOTICE', 'PRESDOCU'] }, publication_date_gte: { type: 'string', description: 'YYYY-MM-DD' }, publication_date_lte: { type: 'string', description: 'YYYY-MM-DD' }, order: { type: 'string', enum: ['newest', 'oldest', 'relevance'] }, page: { type: 'number' }, per_page: { type: 'number', maximum: 1000 } }, required: ['query'] } },
@@ -131,18 +132,27 @@ function decodeXml(value: string): string {
 export async function arxivSearch(params: any): Promise<unknown> {
   const query = required(params.query, 'query');
   const maxResults = bounded(params.max_results, 10, 100);
-  const response = await axios.get('https://export.arxiv.org/api/query', {
-    timeout: TIMEOUT_MS,
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/atom+xml' },
-    params: {
-      search_query: query,
-      start: Math.max(0, Number(params.start) || 0),
-      max_results: maxResults,
-      sortBy: params.sort_by || 'relevance',
-      sortOrder: params.sort_order || 'descending',
-    },
-    responseType: 'text',
-  });
+  let response;
+  try {
+    response = await axios.get('https://export.arxiv.org/api/query', {
+      timeout: ARXIV_TIMEOUT_MS,
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/atom+xml' },
+      params: {
+        search_query: query,
+        start: Math.max(0, Number(params.start) || 0),
+        max_results: maxResults,
+        sortBy: params.sort_by || 'relevance',
+        sortOrder: params.sort_order || 'descending',
+      },
+      responseType: 'text',
+    });
+  } catch (error: any) {
+    const status = Number(error?.response?.status) || 0;
+    const transient = status === 429 || status >= 500 ||
+      ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(String(error?.code || ''));
+    if (!transient) throw error;
+    return arxivOpenAlexFallback(query, params, maxResults, status || String(error?.code || 'unavailable'));
+  }
   const xml = String(response.data);
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map(match => {
     const entry = match[1];
@@ -165,9 +175,80 @@ export async function arxivSearch(params: any): Promise<unknown> {
     };
   });
   return {
+    source: 'arxiv_official_atom_api',
+    degraded: false,
     total_results: Number(xmlText(xml, 'opensearch:totalResults') || entries.length),
     start_index: Number(xmlText(xml, 'opensearch:startIndex') || 0),
     items_per_page: Number(xmlText(xml, 'opensearch:itemsPerPage') || entries.length),
+    entries,
+  };
+}
+
+function normalizeArxivQueryForOpenAlex(query: string): string {
+  return query
+    .replace(/\b(?:all|ti|au|abs|cat|co|jr|rn|id):/gi, '')
+    .replace(/\b(?:AND|OR)\b/gi, ' ')
+    .replace(/\bANDNOT\b/gi, ' ')
+    .replace(/[()"']/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function arxivOpenAlexFallback(
+  query: string,
+  params: any,
+  maxResults: number,
+  officialFailure: string | number,
+): Promise<unknown> {
+  const normalizedQuery = normalizeArxivQueryForOpenAlex(query) || query;
+  const start = Math.max(0, Number(params.start) || 0);
+  const sortOrder = params.sort_order === 'ascending' ? '' : '-';
+  const sort = params.sort_by === 'submittedDate'
+    ? `${sortOrder}publication_date`
+    : params.sort_by === 'lastUpdatedDate'
+      ? `${sortOrder}updated_date`
+      : undefined;
+  const apiKey = process.env.OPENALEX_API_KEY?.trim();
+  const response = await client('https://api.openalex.org').get('/works', { params: {
+    search: normalizedQuery,
+    filter: 'locations.source.id:S4306400194',
+    'per-page': maxResults,
+    page: Math.floor(start / maxResults) + 1,
+    select: 'id,display_name,doi,publication_date,updated_date,authorships,locations,primary_topic',
+    ...(sort ? { sort } : {}),
+    ...(apiKey ? { api_key: apiKey } : {}),
+  }});
+  const data = response.data || {};
+  const results = Array.isArray(data.results) ? data.results : [];
+  const entries = results.map((work: any) => {
+    const arxivLocation = (Array.isArray(work.locations) ? work.locations : [])
+      .find((location: any) => /^https?:\/\/(?:[^/]+\.)?arxiv\.org\//i.test(location?.landing_page_url || ''));
+    return {
+      id: arxivLocation?.landing_page_url || work.id || null,
+      title: work.display_name || null,
+      summary: null,
+      published: work.publication_date || null,
+      updated: work.updated_date || null,
+      authors: (work.authorships || []).map((authorship: any) => authorship?.author?.display_name).filter(Boolean),
+      categories: work.primary_topic?.subfield?.display_name ? [work.primary_topic.subfield.display_name] : [],
+      links: (work.locations || []).map((location: any) => ({
+        href: location?.landing_page_url || location?.pdf_url || null,
+        rel: location?.is_oa ? 'alternate' : null,
+        type: location?.pdf_url ? 'application/pdf' : null,
+      })).filter((link: any) => link.href),
+      doi: work.doi?.replace(/^https?:\/\/(dx\.)?doi\.org\//i, '') || null,
+      journal_reference: null,
+      primary_category: work.primary_topic?.display_name || null,
+      openalex_id: work.id || null,
+    };
+  });
+  return {
+    source: 'openalex_arxiv_index_fallback',
+    degraded: true,
+    notice: `Official arXiv API unavailable (${officialFailure}); returned works with an arXiv repository location from OpenAlex.`,
+    total_results: Number(data.meta?.count || entries.length),
+    start_index: start,
+    items_per_page: entries.length,
     entries,
   };
 }
