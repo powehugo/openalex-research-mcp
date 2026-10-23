@@ -2147,13 +2147,21 @@ function hasValidBearerToken(req: IncomingMessage): boolean {
   return expectedBytes.length === suppliedBytes.length && timingSafeEqual(expectedBytes, suppliedBytes);
 }
 
-function authMode(): 'bearer' | 'oauth' | 'mixed' {
+function authMode(): 'bearer' | 'oauth' | 'mixed' | 'none' {
   const configured = (process.env.MCP_AUTH_MODE || 'bearer').trim().toLowerCase();
-  return configured === 'oauth' || configured === 'mixed' ? configured : 'bearer';
+  return configured === 'oauth' || configured === 'mixed' || configured === 'none' ? configured : 'bearer';
+}
+
+function authConfigured(mode: ReturnType<typeof authMode>): boolean {
+  if (mode === 'none') return true;
+  if (mode === 'bearer') return !!process.env.MCP_BEARER_TOKEN?.trim();
+  if (mode === 'oauth') return oauthConfigured();
+  return !!process.env.MCP_BEARER_TOKEN?.trim() && oauthConfigured();
 }
 
 async function isAuthorized(req: IncomingMessage): Promise<boolean> {
   const mode = authMode();
+  if (mode === 'none') return true;
   if ((mode === 'bearer' || mode === 'mixed') && hasValidBearerToken(req)) return true;
   return (mode === 'oauth' || mode === 'mixed') && await hasValidOAuthToken(req);
 }
@@ -2171,16 +2179,12 @@ async function startHttp(): Promise<void> {
     if (url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       const mode = authMode();
-      const configured = mode === 'bearer'
-        ? !!process.env.MCP_BEARER_TOKEN?.trim()
-        : mode === 'oauth'
-          ? oauthConfigured()
-          : !!process.env.MCP_BEARER_TOKEN?.trim() && oauthConfigured();
+      const configured = authConfigured(mode);
       res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, authentication: { type: mode, configured }, sources: externalSourceStatus() }));
       return;
     }
     if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
-      if (!oauthConfigured()) {
+      if (authMode() === 'none' || !oauthConfigured()) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'OAuth is not configured' }));
         return;
@@ -2195,11 +2199,7 @@ async function startHttp(): Promise<void> {
       return;
     }
     const mode = authMode();
-    const authIsConfigured = mode === 'bearer'
-      ? !!process.env.MCP_BEARER_TOKEN?.trim()
-      : mode === 'oauth'
-        ? oauthConfigured()
-        : !!process.env.MCP_BEARER_TOKEN?.trim() && oauthConfigured();
+    const authIsConfigured = authConfigured(mode);
     if (!authIsConfigured) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `${mode} authentication is not configured` }));
