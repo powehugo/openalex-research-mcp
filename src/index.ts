@@ -2180,7 +2180,7 @@ async function startHttp(): Promise<void> {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       const mode = authMode();
       const configured = authConfigured(mode);
-      res.end(JSON.stringify({ status: 'healthy', version: VERSION, endpoint, authentication: { type: mode, configured }, sources: externalSourceStatus() }));
+      res.end(JSON.stringify({ status: 'healthy', version: VERSION, authentication: { type: mode, configured }, sources: externalSourceStatus() }));
       return;
     }
     if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
@@ -2195,7 +2195,7 @@ async function startHttp(): Promise<void> {
     }
     if (url.pathname !== endpoint) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found', mcpEndpoint: endpoint, healthEndpoint: '/health' }));
+      res.end(JSON.stringify({ error: 'Not found' }));
       return;
     }
     const mode = authMode();
