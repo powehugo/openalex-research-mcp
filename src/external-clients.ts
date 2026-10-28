@@ -1,3 +1,4 @@
+import { openAlexKeys } from './openalex-keys.js';
 import axios, { AxiosInstance } from 'axios';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -239,7 +240,7 @@ async function arxivOpenAlexFallback(
     : params.sort_by === 'lastUpdatedDate'
       ? `${sortOrder}updated_date`
       : undefined;
-  const apiKey = process.env.OPENALEX_API_KEY?.trim();
+  const apiKey = openAlexKeys.current();
   const queryParams = {
     search: normalizedQuery,
     filter: 'locations.source.id:S4306400194',
@@ -256,7 +257,8 @@ async function arxivOpenAlexFallback(
     }});
   } catch (error: any) {
     const status = Number(error?.response?.status) || 0;
-    if (!apiKey || ![401, 403].includes(status)) throw error;
+    if (!apiKey || ![401, 403, 429].includes(status)) throw error;
+    if (status === 429) openAlexKeys.markRateLimited(apiKey, error?.response?.data); else openAlexKeys.markInvalid(apiKey);
     response = await client('https://api.openalex.org').get('/works', { params: queryParams });
   }
   const data = response.data || {};
@@ -349,6 +351,7 @@ export async function regulationsSearch(params: any): Promise<unknown> {
 
 export function externalSourceStatus(): Record<string, unknown> {
   return {
+    openAlex: { apiKeys: openAlexKeys.status() },
     semanticScholar: { enabled: true, apiKeyConfigured: !!process.env.S2_API_KEY },
     dataCite: { enabled: true, authenticationRequired: false },
     arXiv: { enabled: true, authenticationRequired: false },

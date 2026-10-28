@@ -28,6 +28,7 @@ import {
   externalSourceStatus, federalRegisterDocument, federalRegisterSearch, regulationsSearch,
   semanticScholarEdges, semanticScholarPaper, semanticScholarRecommendations, semanticScholarSearch,
 } from './external-clients.js';
+import { openAlexKeys } from './openalex-keys.js';
 import { hasValidOAuthToken, oauthConfigured, oauthProtectedResourceMetadata } from './oauth-auth.js';
 
 // Handle `openalex-research-mcp setup [flags]` before starting the MCP server
@@ -40,7 +41,7 @@ if (process.argv[2] === 'setup') {
 
 debug('Server starting...');
 debug('Email:', process.env.OPENALEX_EMAIL);
-debug('API Key:', process.env.OPENALEX_API_KEY ? 'Set' : 'Not set');
+debug('OpenAlex API keys configured:', openAlexKeys.size);
 
 // Initialize OpenAlex client
 const openAlexClient = new OpenAlexClient();
@@ -2069,7 +2070,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   baseUrl: CONFIG.API.BASE_URL,
                   timeout: CONFIG.API.TIMEOUT,
                   emailConfigured: !!process.env.OPENALEX_EMAIL,
-                  apiKeyConfigured: !!process.env.OPENALEX_API_KEY,
+                  apiKeyConfigured: openAlexKeys.size > 0,
+                  apiKeys: openAlexKeys.status(),
                 },
                 cache: {
                   enabled: true,

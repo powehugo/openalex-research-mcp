@@ -1,3 +1,4 @@
+import { openAlexKeys } from './openalex-keys.js';
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { CONFIG, debug } from './config.js';
 
@@ -84,13 +85,13 @@ export interface OpenAlexResponse<T> {
 export class OpenAlexClient {
   private client: AxiosInstance;
   private email?: string;
-  private apiKey?: string;
+  private explicitApiKey?: string;
   private cache: SimpleCache<any>;
   private enableCache: boolean;
 
   constructor(config: OpenAlexConfig = {}) {
     this.email = config.email || process.env.OPENALEX_EMAIL;
-    this.apiKey = config.apiKey || process.env.OPENALEX_API_KEY;
+    this.explicitApiKey = config.apiKey?.trim() || undefined;
     this.enableCache = config.enableCache ?? true;
 
     const baseUrl = config.baseUrl || CONFIG.API.BASE_URL;
@@ -109,28 +110,57 @@ export class OpenAlexClient {
 
     // Add response interceptor for 429 rate-limit handling with bounded retry
     this.client.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        openAlexKeys.markSuccess((response.config as any)?.params?.api_key);
+        return response;
+      },
       async (error: AxiosError) => {
-        if ([401, 403].includes(Number(error.response?.status)) && error.config) {
-          const config = error.config as any;
-          if (this.apiKey && config.params?.api_key && !config._openAlexPublicRetry) {
+        const status = Number(error.response?.status);
+        const config = error.config as any;
+        const usedKey: string | undefined = config?.params?.api_key;
+        const pooled = !!usedKey && usedKey !== this.explicitApiKey;
+
+        if ([401, 403].includes(status) && config && usedKey) {
+          if (pooled) openAlexKeys.markInvalid(usedKey);
+          else this.explicitApiKey = undefined;
+          const next = this.apiKey;
+          config._keyRotations = (config._keyRotations || 0) + 1;
+          if (next && next !== usedKey && config._keyRotations <= openAlexKeys.size + 1) {
+            debug('OpenAlex rejected an API key; retrying with the next configured key.');
+            config.params.api_key = next;
+            return this.client.request(config);
+          }
+          if (!config._openAlexPublicRetry) {
             config._openAlexPublicRetry = true;
             delete config.params.api_key;
             if (this.email) config.params.mailto = this.email;
-            this.apiKey = undefined;
-            debug('OpenAlex rejected the configured API key; retrying through the public read-only API.');
+            debug('No usable OpenAlex API key left; retrying through the public API.');
             return this.client.request(config);
           }
         }
-        if (error.response?.status === 429 && error.config) {
-          const config = error.config as any;
+
+        if (status === 429 && config) {
+          if (pooled) {
+            const parkedForDay = openAlexKeys.markRateLimited(usedKey!, error.response?.data);
+            const next = openAlexKeys.current();
+            config._keyRotations = (config._keyRotations || 0) + 1;
+            if (next && next !== usedKey && config._keyRotations <= openAlexKeys.size * 2) {
+              debug(`OpenAlex 429 on one key (${parkedForDay ? 'parked until UTC midnight' : 'short cooldown'}); switching key.`);
+              config.params.api_key = next;
+              return this.client.request(config);
+            }
+            if (!next) {
+              delete config.params.api_key;
+              if (this.email) config.params.mailto = this.email;
+            }
+          }
           config._429RetryCount = (config._429RetryCount || 0) + 1;
           if (config._429RetryCount > CONFIG.API.RETRY.MAX_429_RETRIES) {
             const err = new Error('Rate limit exceeded after multiple retries. Please wait before making more requests.');
             (err as any).isRateLimitExhausted = true;
             throw err;
           }
-          const retryAfter = parseInt(error.response.headers['retry-after'] || '5', 10);
+          const retryAfter = parseInt(error.response!.headers['retry-after'] || '5', 10);
           const delayMs = Math.min(retryAfter * 1000, CONFIG.API.RETRY.MAX_DELAY_MS);
           debug(`429 rate limited (attempt ${config._429RetryCount}/${CONFIG.API.RETRY.MAX_429_RETRIES}) — sleeping ${delayMs}ms`);
           await this.sleep(delayMs);
@@ -139,6 +169,11 @@ export class OpenAlexClient {
         throw error;
       }
     );
+  }
+
+  /** Key for the next request: an explicit constructor key, else the first usable pooled key. */
+  private get apiKey(): string | undefined {
+    return this.explicitApiKey ?? openAlexKeys.current();
   }
 
   private async sleep(ms: number): Promise<void> {

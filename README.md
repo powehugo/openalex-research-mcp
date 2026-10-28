@@ -211,6 +211,8 @@ For premium users with an API key:
 
 ```bash
 export OPENALEX_API_KEY="your-api-key"
+# or several keys, rotated automatically when one is out of daily budget:
+# export OPENALEX_API_KEYS="key-one,key-two"
 ```
 
 ### Claude Desktop Configuration
