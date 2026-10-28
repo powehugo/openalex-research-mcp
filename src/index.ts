@@ -1073,7 +1073,14 @@ const server = new Server(
 // List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   debug('ListTools:', tools.length, 'tools');
-  return { tools };
+  // Every tool only reads public scholarly APIs; mark them read-only so clients
+  // such as ChatGPT do not ask for write-action confirmation on each call.
+  return {
+    tools: tools.map(tool => ({
+      ...tool,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true, ...(tool as any).annotations },
+    })),
+  };
 });
 
 // Handle tool calls
