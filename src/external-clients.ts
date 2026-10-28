@@ -58,37 +58,72 @@ const S2_FIELDS = [
   'publicationTypes', 'publicationDate', 'journal', 'authors',
 ].join(',');
 
-function s2(): AxiosInstance {
-  const apiKey = process.env.S2_API_KEY?.trim();
-  return client('https://api.semanticscholar.org', apiKey ? { 'x-api-key': apiKey } : {});
+/**
+ * Semantic Scholar key pool. Keys come from S2_API_KEYS (comma, semicolon,
+ * whitespace or newline separated) plus the single S2_API_KEY. Each key is
+ * limited to about one request per second, so requests are spread over the
+ * keys: every request takes the key that is free soonest and waits until that
+ * key's last request is S2_MIN_INTERVAL_MS old. A 403 drops the key; a 429
+ * cools it down for Retry-After (min 2 s) and the request moves to another
+ * key. With no usable key, requests go to the shared anonymous pool.
+ */
+type S2Key = { key: string | undefined; lastStart: number; coolUntil: number; invalid: boolean };
+
+function parseS2Keys(): string[] {
+  const raw = [process.env.S2_API_KEYS || '', process.env.S2_API_KEY || ''].join(',');
+  return [...new Set(raw.split(/[\s,;]+/).map(k => k.trim()).filter(Boolean))];
 }
 
-async function waitForS2Slot(): Promise<void> {
+const s2Keys: S2Key[] = parseS2Keys().map(key => ({ key, lastStart: 0, coolUntil: 0, invalid: false }));
+const s2Anonymous: S2Key = { key: undefined, lastStart: 0, coolUntil: 0, invalid: false };
+
+function s2Api(key: string | undefined): AxiosInstance {
+  return client(process.env.S2_BASE_URL || 'https://api.semanticscholar.org', key ? { 'x-api-key': key } : {});
+}
+
+function nextS2Slot(): S2Key {
+  const usable = s2Keys.filter(k => !k.invalid);
+  const pool = usable.length ? usable : [s2Anonymous];
+  const readyAt = (k: S2Key) => Math.max(k.coolUntil, k.lastStart + S2_MIN_INTERVAL_MS);
+  return pool.reduce((best, k) => (readyAt(k) < readyAt(best) ? k : best));
+}
+
+async function waitForS2Slot(): Promise<S2Key> {
   const slot = s2ThrottleQueue.then(async () => {
-    const waitMs = Math.max(0, S2_MIN_INTERVAL_MS - (Date.now() - s2LastRequestStartedAt));
+    const k = nextS2Slot();
+    const waitMs = Math.max(0, Math.max(k.coolUntil, k.lastStart + S2_MIN_INTERVAL_MS) - Date.now());
     if (waitMs) await new Promise(resolve => setTimeout(resolve, waitMs));
-    s2LastRequestStartedAt = Date.now();
+    k.lastStart = Date.now();
+    s2LastRequestStartedAt = k.lastStart;
+    return k;
   });
-  s2ThrottleQueue = slot.catch(() => undefined);
-  await slot;
+  s2ThrottleQueue = slot.then(() => undefined, () => undefined);
+  return slot;
 }
 
-async function s2Request<T>(request: () => Promise<T>): Promise<T> {
+async function s2Request<T>(request: (api: AxiosInstance) => Promise<T>): Promise<T> {
+  const maxAttempts = Math.max(3, s2Keys.length * 2 + 1);
   for (let attempt = 0; ; attempt++) {
-    await waitForS2Slot();
+    const slot = await waitForS2Slot();
     try {
-      return await request();
+      return await request(s2Api(slot.key));
     } catch (error: any) {
-      if (Number(error?.response?.status) !== 429 || attempt >= 2) throw error;
-      const retryAfter = Math.max(1, Number(error?.response?.headers?.['retry-after']) || 1);
-      await new Promise(resolve => setTimeout(resolve, Math.min(retryAfter * 1000, 10_000)));
+      const status = Number(error?.response?.status);
+      if (status === 403 && slot.key) { slot.invalid = true; continue; }
+      if (status !== 429 || attempt + 1 >= maxAttempts) throw error;
+      const retryAfter = Math.max(2, Number(error?.response?.headers?.['retry-after']) || 2);
+      slot.coolUntil = Date.now() + Math.min(retryAfter * 1000, 10_000);
     }
   }
 }
 
+export function s2KeyStatus(): { configured: number; available: number; invalid: number } {
+  const invalid = s2Keys.filter(k => k.invalid).length;
+  return { configured: s2Keys.length, available: s2Keys.length - invalid, invalid };
+}
+
 export async function semanticScholarSearch(params: any): Promise<unknown> {
-  const api = s2();
-  const response = await s2Request(() => api.get('/graph/v1/paper/search', { params: {
+  const response = await s2Request(api => api.get('/graph/v1/paper/search', { params: {
     query: required(params.query, 'query'),
     limit: bounded(params.limit, 10, 100),
     offset: Math.max(0, Number(params.offset) || 0),
@@ -102,14 +137,12 @@ export async function semanticScholarSearch(params: any): Promise<unknown> {
 
 export async function semanticScholarPaper(params: any): Promise<unknown> {
   const id = encodeURIComponent(required(params.paper_id, 'paper_id'));
-  const api = s2();
-  return (await s2Request(() => api.get(`/graph/v1/paper/${id}`, { params: { fields: S2_FIELDS } }))).data;
+  return (await s2Request(api => api.get(`/graph/v1/paper/${id}`, { params: { fields: S2_FIELDS } }))).data;
 }
 
 export async function semanticScholarEdges(params: any, edge: 'citations' | 'references'): Promise<unknown> {
   const id = encodeURIComponent(required(params.paper_id, 'paper_id'));
-  const api = s2();
-  return (await s2Request(() => api.get(`/graph/v1/paper/${id}/${edge}`, { params: {
+  return (await s2Request(api => api.get(`/graph/v1/paper/${id}/${edge}`, { params: {
     limit: bounded(params.limit, 20, 1000),
     offset: Math.max(0, Number(params.offset) || 0),
     fields: S2_FIELDS,
@@ -124,8 +157,7 @@ export async function semanticScholarRecommendations(params: any): Promise<unkno
     ? params.negative_paper_ids.filter((id: unknown) => typeof id === 'string' && id.trim()).slice(0, 100)
     : [];
   if (!positivePaperIds.length) throw new Error('positive_paper_ids must contain at least one paper ID');
-  const api = s2();
-  return (await s2Request(() => api.post('/recommendations/v1/papers',
+  return (await s2Request(api => api.post('/recommendations/v1/papers',
     { positivePaperIds, negativePaperIds },
     { params: { limit: bounded(params.limit, 20, 500), fields: S2_FIELDS } },
   ))).data;
@@ -354,7 +386,7 @@ export function externalSourceStatus(): Record<string, unknown> {
   return {
     openAlex: { apiKeys: openAlexKeys.status() },
     googleScholar: scholarStatus(),
-    semanticScholar: { enabled: true, apiKeyConfigured: !!process.env.S2_API_KEY },
+    semanticScholar: { enabled: true, apiKeyConfigured: s2Keys.length > 0, apiKeys: s2KeyStatus() },
     dataCite: { enabled: true, authenticationRequired: false },
     arXiv: { enabled: true, authenticationRequired: false },
     crossref: { enabled: true, mailtoConfigured: !!process.env.CROSSREF_MAILTO },
