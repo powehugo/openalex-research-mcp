@@ -29,6 +29,7 @@ import {
   semanticScholarEdges, semanticScholarPaper, semanticScholarRecommendations, semanticScholarSearch,
 } from './external-clients.js';
 import { openAlexKeys } from './openalex-keys.js';
+import { SCHOLAR_TOOLS, googleScholarAuthor, googleScholarCite, googleScholarQuota, googleScholarSearch } from './serpapi-scholar.js';
 import { hasValidOAuthToken, oauthConfigured, oauthProtectedResourceMetadata } from './oauth-auth.js';
 
 // Handle `openalex-research-mcp setup [flags]` before starting the MCP server
@@ -1042,6 +1043,7 @@ const tools: Tool[] = [
   },
 
   ...EXTERNAL_TOOLS,
+  ...SCHOLAR_TOOLS,
 
   {
     name: 'health_check',
@@ -2054,6 +2056,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(await federalRegisterSearch(params), null, 2) }] };
       case 'federal_register_get_document':
         return { content: [{ type: 'text', text: JSON.stringify(await federalRegisterDocument(params), null, 2) }] };
+      case 'google_scholar_search':
+        return { content: [{ type: 'text', text: JSON.stringify(await googleScholarSearch(params), null, 2) }] };
+      case 'google_scholar_author':
+        return { content: [{ type: 'text', text: JSON.stringify(await googleScholarAuthor(params), null, 2) }] };
+      case 'google_scholar_cite':
+        return { content: [{ type: 'text', text: JSON.stringify(await googleScholarCite(params), null, 2) }] };
+      case 'google_scholar_quota':
+        return { content: [{ type: 'text', text: JSON.stringify(await googleScholarQuota(), null, 2) }] };
       case 'regulations_gov_search':
         return { content: [{ type: 'text', text: JSON.stringify(await regulationsSearch(params), null, 2) }] };
 

@@ -1,3 +1,4 @@
+import { scholarStatus } from './serpapi-scholar.js';
 import { openAlexKeys } from './openalex-keys.js';
 import axios, { AxiosInstance } from 'axios';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
@@ -352,6 +353,7 @@ export async function regulationsSearch(params: any): Promise<unknown> {
 export function externalSourceStatus(): Record<string, unknown> {
   return {
     openAlex: { apiKeys: openAlexKeys.status() },
+    googleScholar: scholarStatus(),
     semanticScholar: { enabled: true, apiKeyConfigured: !!process.env.S2_API_KEY },
     dataCite: { enabled: true, authenticationRequired: false },
     arXiv: { enabled: true, authenticationRequired: false },
